@@ -9,6 +9,9 @@ import deep_gemm
 from deep_gemm.jit import template
 from deep_gemm.jit.template import TemplateError
 
+# Check for CUDA availability
+CUDA_AVAILABLE = torch.cuda.is_available()
+
 
 class TemplateTests(unittest.TestCase):
     """Test the enhanced template module functionality."""
@@ -49,6 +52,7 @@ class TemplateTests(unittest.TestCase):
         result = template.cpp_format(template_str, keys)
         self.assertEqual(result, "Hello World!")
         
+    @unittest.skipIf(not CUDA_AVAILABLE, "CUDA not available")
     def test_map_ctype(self):
         """Test the map_ctype function."""
         # Test basic types
@@ -72,6 +76,17 @@ class TemplateTests(unittest.TestCase):
         cpu_tensor = torch.zeros(1, dtype=torch.float)
         with self.assertRaises(TemplateError):
             template.map_ctype(cpu_tensor)
+    
+    def test_map_ctype_basic(self):
+        """Test the map_ctype function with basic types (non-CUDA)."""
+        # Test basic types that don't require CUDA
+        self.assertIsNotNone(template.map_ctype(True))
+        self.assertIsNotNone(template.map_ctype(42))
+        self.assertIsNotNone(template.map_ctype(3.14))
+        
+        # Test unsupported type
+        with self.assertRaises(TemplateError):
+            template.map_ctype("string")
             
     def test_validate_includes(self):
         """Test the validate_includes function."""

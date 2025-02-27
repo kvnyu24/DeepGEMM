@@ -10,6 +10,20 @@ from deep_gemm.jit import compiler
 from deep_gemm.jit.compiler import JITCompilationError, ValidationError
 
 
+# Check for CUDA availability
+CUDA_AVAILABLE = torch.cuda.is_available()
+
+# Check for NVCC availability
+def is_nvcc_available():
+    try:
+        compiler.get_nvcc_compiler()
+        return True
+    except ValidationError:
+        return False
+
+NVCC_AVAILABLE = is_nvcc_available()
+
+
 class JITRobustnessTests(unittest.TestCase):
     """Test the robustness of the JIT compilation system."""
     
@@ -72,6 +86,7 @@ class JITRobustnessTests(unittest.TestCase):
         # Valid parameters should not raise
         compiler.validate_build_params("test", (('a', int),), "int main() {}")
         
+    @unittest.skipIf(not NVCC_AVAILABLE, "NVCC compiler not available")
     def test_error_handling_invalid_code(self):
         """Test that errors in compilation are handled correctly."""
         # Code with a syntax error
@@ -88,33 +103,26 @@ class JITRobustnessTests(unittest.TestCase):
             
     def test_cache_clear(self):
         """Test that the cache can be cleared."""
-        # First, build a valid kernel
-        args = (('a', int),)
-        code = """
-        extern "C" void launch(int a, int& __return_code) {
-            __return_code = 42;
-        }
-        """
-        
-        runtime = compiler.build("test_clear", args, code)
-        
-        # Check that the cache directory contains our kernel
+        # We'll test the cache clearing functionality without actually compiling
+        # Create a fake cache directory with a kernel-like directory
         cache_dir = compiler.get_cache_dir()
-        directories = [d for d in os.listdir(cache_dir) if d.startswith('kernel.test_clear')]
-        self.assertTrue(len(directories) > 0, "Kernel directory not found in cache")
+        os.makedirs(os.path.join(cache_dir, 'kernel.test_clear_fake'), exist_ok=True)
+        
+        # Mock the runtime cache with a fake entry
+        compiler.runtime_cache.cache = {'fake_path': 'fake_runtime'}
         
         # Clear the cache
         num_removed = compiler.clear_cache()
-        self.assertGreaterEqual(num_removed, 0, "Should return a valid count of removed entries")
+        self.assertGreaterEqual(num_removed, 1, "Should return a valid count of removed entries")
         
         # Check that the cache directory is now empty
         directories = [d for d in os.listdir(cache_dir) if d.startswith('kernel.test_clear')]
         self.assertEqual(len(directories), 0, "Cache directory should be empty after clearing")
         
     def test_nvcc_compiler_detection(self):
-        """Test that the NVCC compiler is detected correctly."""
-        # We can only assert that this doesn't raise an exception
-        # since we expect a working environment with NVCC installed
+        """Test that the NVCC compiler is detected or handled gracefully."""
+        # If NVCC is not available, this should raise ValidationError
+        # If it is available, it should return a valid path and version
         try:
             compiler_path, version = compiler.get_nvcc_compiler()
             self.assertIsNotNone(compiler_path, "Compiler path should not be None")
@@ -123,6 +131,8 @@ class JITRobustnessTests(unittest.TestCase):
             # Skip this test if NVCC is not available
             self.skipTest("NVCC compiler not available")
             
+    @unittest.skipIf(not CUDA_AVAILABLE, "CUDA not available")
+    @unittest.skipIf(not NVCC_AVAILABLE, "NVCC compiler not available")
     def test_runtime_validation(self):
         """Test that runtime validates arguments correctly."""
         # Create a simple kernel
@@ -158,8 +168,13 @@ class JITRobustnessTests(unittest.TestCase):
         with self.assertRaises(Exception):
             runtime(tensor, 42)
             
+    @unittest.skipIf(not NVCC_AVAILABLE, "NVCC compiler not available")
     def test_caching_behavior(self):
         """Test that caching works correctly."""
+        # Skip the actual test if NVCC is not available
+        if not NVCC_AVAILABLE:
+            self.skipTest("NVCC compiler not available")
+            
         # Create a simple kernel
         args = (('a', int),)
         code = """
