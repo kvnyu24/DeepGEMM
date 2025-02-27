@@ -2,6 +2,15 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 #pragma once
 
+/**
+ * @file fp8_gemm.cuh
+ * @brief Core implementation of FP8 GEMM kernels with fine-grained scaling
+ * 
+ * This file contains the main kernel implementation for FP8 matrix multiplication
+ * with per-channel scaling, optimized for NVIDIA Hopper architecture.
+ * It implements both normal and grouped GEMMs for MoE models.
+ */
+
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
@@ -16,17 +25,58 @@
 
 namespace deep_gemm {
 
+/**
+ * Matrix layout enumeration
+ */
 enum class Layout {
-    RowMajor,
-    ColMajor
+    RowMajor,  ///< Row-major layout (C/C++ style)
+    ColMajor   ///< Column-major layout (Fortran style)
 };
 
+/**
+ * Calculate the total number of threads needed per SM based on the block size and thread allocations.
+ * 
+ * @tparam kNumTMAThreads Number of threads dedicated to TMA operations
+ * @tparam kNumMathThreadsPerGroup Number of threads per math group for MMA operations
+ * @param block_m Size of the block in the M dimension
+ * @return Total number of threads needed per SM
+ */
 template <uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup>
 __device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
     DG_STATIC_ASSERT(kNumMathThreadsPerGroup == 128, "Only support 128 threads per math group");
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
+/**
+ * Main FP8 GEMM kernel implementation.
+ * 
+ * This kernel performs matrix multiplication C = A * B^T where:
+ * - A and B are FP8 matrices with fine-grained scaling
+ * - C is output as BF16
+ * 
+ * The kernel supports both normal GEMM and grouped GEMM operations for MoE models.
+ * 
+ * @tparam SHAPE_N The N dimension of the overall matrix
+ * @tparam SHAPE_K The K dimension of the overall matrix
+ * @tparam BLOCK_M The M dimension of each block
+ * @tparam BLOCK_N The N dimension of each block
+ * @tparam BLOCK_K The K dimension of each block (must be 128 for per-channel scaling)
+ * @tparam kNumGroups Number of expert groups for MoE (1 for normal GEMM)
+ * @tparam kNumStages Number of pipeline stages for data loading
+ * @tparam kNumTMAThreads Number of threads dedicated to TMA operations
+ * @tparam kNumMathThreadsPerGroup Number of threads per math group for MMA operations
+ * @tparam kNumTMAMulticast Number of TMA multicast operations
+ * @tparam kGemmType Type of GEMM operation (normal, masked grouped, or contiguous grouped)
+ * 
+ * @param[out] gmem_d Output matrix (BF16)
+ * @param[in] scales_b Scaling factors for matrix B
+ * @param[in] grouped_layout Layout information for grouped GEMM
+ * @param[in] shape_m The M dimension of the overall matrix
+ * @param[in] tensor_map_a TMA descriptor for matrix A
+ * @param[in] tensor_map_b TMA descriptor for matrix B
+ * @param[in] tensor_map_scales_a TMA descriptor for scaling factors of matrix A
+ * @param[in] tensor_map_d TMA descriptor for output matrix D
+ */
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
@@ -41,15 +91,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 const __grid_constant__ CUtensorMap tensor_map_scales_a,
                 const __grid_constant__ CUtensorMap tensor_map_d) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
-    // Scaling checks
+    // Validate that we're using a supported architecture and scaling configuration
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
 
-    // Types
+    // Define the types used in this kernel
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-    // Shared memory
+    // Calculate shared memory requirements for different data buffers
     static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(__nv_bfloat16);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
@@ -57,7 +107,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     static constexpr uint32_t SHAPE_K_SCALES = ceil_div(SHAPE_K, BLOCK_K);
     static constexpr int kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
 
-    // Configs
+    // Configuration constants
     constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
     constexpr uint32_t kNumThreads = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
     constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;
@@ -65,7 +115,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_id();
 
-    // Prefetch TMA descriptors at very beginning
+    // Prefetch TMA descriptors to improve performance
+    // This loads the descriptors into cache before they're needed
     if (threadIdx.x == kNumMathThreads) {
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_a));
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_b));
@@ -74,24 +125,25 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     }
     __syncwarp();
 
-    // Align to 1024 bytes for swizzle-128B
+    // Allocate shared memory, ensuring proper alignment for optimal memory access
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
-    // Data on shared memory
+    // Pointers to different sections of shared memory
     auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
     __nv_fp8_e4m3* smem_a[kNumStages];
     __nv_fp8_e4m3* smem_b[kNumStages];
     float* smem_scales_a[kNumStages];
     float* smem_scales_b;
 
-    // TMA Barrier for both divisible and non-divisible cases
+    // Barriers for synchronizing TMA operations between stages
     Barrier* full_barriers[kNumStages];
     Barrier* empty_barriers[kNumStages];
 
-    // Fill shared memory pointers
+    // Initialize shared memory pointers for each pipeline stage
     #pragma unroll
-    for (int i = 0; i < kNumStages; ++ i) {
+    for (int i = 0; i < kNumStages; ++i) {
+        // Calculate offsets for different data regions in shared memory
         smem_a[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE);
         smem_b[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
         smem_scales_a[i] = reinterpret_cast<float*>(smem_buffer + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) + i * SMEM_SCALES_A_SIZE_PER_STAGE);
